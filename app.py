@@ -76,8 +76,8 @@ st.sidebar.title("⚙️ Kontrollpanel")
 
 st.sidebar.subheader("1. Last opp SCATT-filer")
 opplastede_filer = st.sidebar.file_uploader(
-    "Velg CSV-filer", 
-    type="csv", 
+    "Velg SCATT-filer", 
+    type=["csv", "txt", "scatt"], # Endret her for å tillate flere filtyper
     accept_multiple_files=True,
     help="Du kan laste opp filer fra både gammel og ny SCATT-versjon."
 )
