@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import datetime
 import re
+import olefile
+import io
 
 # ==========================================
 # 1. KONFIGURASJON AV SIDEN
@@ -14,7 +16,7 @@ if 'treningsdata' not in st.session_state:
     )
 
 # ==========================================
-# 2. HJELPEFUNKSJONER (Smarte detektiver)
+# 2. HJELPEFUNKSJONER OG "LÅSESMED"
 # ==========================================
 def finn_dato_fra_filnavn(filnavn):
     """Finner dato automatisk fra filnavnet."""
@@ -23,48 +25,62 @@ def finn_dato_fra_filnavn(filnavn):
         try:
             d1, d2, d3 = match.groups()
             aar = int(d3)
-            if aar < 100: aar += 2000
+            if aar < 100: 
+                aar += 2000
             return datetime.date(aar, int(d2), int(d1))
         except ValueError:
             pass
     return datetime.date.today()
 
 def finn_stilling_i_tekst(tekst):
-    """
-    Smartegreie 2: Leter etter stilling inni selve filen.
-    Søker etter både engelske og norske begreper.
-    """
-    # Vi gjør all tekst til små bokstaver for å gjøre søket enklere
+    """Leter etter stilling inni filen."""
     tekst_lower = tekst.lower()
-    
-    # Leter etter Knestående
-    if any(ord in tekst_lower for ord in ['kneeling', 'kne', 'knestående']):
-        return 'Kne'
-        
-    # Leter etter Stående
+    if any(ord in tekst_lower for ord in ['kneeling', 'kne', 'knestående']): return 'Kne'
     if any(ord in tekst_lower for ord in ['standing', 'stå', 'stående']):
-        if '50m' in tekst_lower: 
-            return 'Stå 50m'
-        return 'Stå luft' # Standard stående i din liste
-        
-    # Leter etter Liggende
+        if '50m' in tekst_lower: return 'Stå 50m'
+        return 'Stå luft'
     if any(ord in tekst_lower for ord in ['prone', 'ligg', 'liggende']):
-        if 'sh' in tekst_lower: 
-            return 'Ligg luft (SH)'
-        return 'Ligg' # Standard liggende
-        
-    # Hvis den ikke fant noe av det over
+        if 'sh' in tekst_lower: return 'Ligg luft (SH)'
+        return 'Ligg'
     return 'Ukjent'
 
-def behandle_scatt_fil(fil):
-    """Leser teksten/CSV-en som SCATT eksporterer og fisker ut totalsnittet."""
-    tekst = fil.getvalue().decode('utf-8', errors='ignore')
+def dirk_opp_scatt_fil(fil_bytes):
+    """
+    Dette er låsesmeden. Den sjekker om filen er en OLE-binærfil (.scatt),
+    og trekker ut teksten. Hvis ikke, leses den som vanlig tekst.
+    """
+    fil_io = io.BytesIO(fil_bytes)
     
-    # Vi bruker vår nye detektiv-funksjon her!
+    # Sjekk om dette er en proprietær SCATT binærfil (OLE)
+    if olefile.isOleFile(fil_io):
+        ole = olefile.OleFileIO(fil_io)
+        utvunnet_tekst = ""
+        # Gå gjennom alle "strømmene" inne i den lukkede filen
+        for stream in ole.listdir():
+            try:
+                data = ole.openstream(stream).read()
+                # Rens bort null-bytes som ofte gjemmer teksten i OLE-filer
+                renset_data = data.replace(b'\x00', b'').decode('utf-8', errors='ignore')
+                utvunnet_tekst += renset_data + "\n"
+            except Exception:
+                pass
+        return utvunnet_tekst
+    else:
+        # Hvis det er en vanlig CSV eller TXT
+        # Vi fjerner null-bytes her også for sikkerhets skyld
+        return fil_bytes.replace(b'\x00', b'').decode('utf-8', errors='ignore')
+
+def behandle_scatt_fil(fil):
+    """Mottar filen, bruker låsesmeden, og fisker ut resultatene."""
+    rådata_bytes = fil.getvalue()
+    
+    # Pakk ut teksten fra binærfilen
+    tekst = dirk_opp_scatt_fil(rådata_bytes)
     funnet_stilling = finn_stilling_i_tekst(tekst)
     
     linjer = tekst.strip().split('\n')
-    skilletegn = ';' if tekst[:1000].count(';') > tekst[:1000].count(',') else ','
+    # Finn skilletegn
+    skilletegn = ';' if tekst[:2000].count(';') > tekst[:2000].count(',') else ','
     
     header_rad_index = -1
     overskrifter = []
@@ -76,7 +92,8 @@ def behandle_scatt_fil(fil):
             overskrifter = kolonner
             break
             
-    if header_rad_index == -1: return None
+    if header_rad_index == -1: 
+        return None
         
     siste_gyldige_kolonner = []
     for linje in reversed(linjer[header_rad_index + 1:]):
@@ -85,19 +102,22 @@ def behandle_scatt_fil(fil):
             siste_gyldige_kolonner = kolonner
             break
             
-    if not siste_gyldige_kolonner: return None
+    if not siste_gyldige_kolonner: 
+        return None
 
     def hent_tall(mulige_navn):
         for navn in mulige_navn:
             for i, overskrift in enumerate(overskrifter):
                 if navn.lower() in overskrift and i < len(siste_gyldige_kolonner):
                     verdi_tekst = siste_gyldige_kolonner[i].replace(',', '.')
-                    try: return float(verdi_tekst)
-                    except ValueError: pass
+                    try: 
+                        return float(verdi_tekst)
+                    except ValueError: 
+                        pass
         return None
 
     return {
-        'Stilling_Autodetect': funnet_stilling, # Returnerer stillingen vi fant
+        'Stilling_Autodetect': funnet_stilling,
         'DA': hent_tall(['da', 'd.a']),
         's1': hent_tall(['s1', 's.1']),
         's2': hent_tall(['s2', 's.2']),
@@ -106,36 +126,33 @@ def behandle_scatt_fil(fil):
     }
 
 # ==========================================
-# 3. SIDEBAR (MASSEOPPLASTING)
+# 3. SIDEBAR (MENY)
 # ==========================================
 st.sidebar.title("⚙️ Kontrollpanel")
 
 st.sidebar.subheader("1. Lynrask Masseopplasting")
-st.sidebar.markdown("Dra og slipp CSV/TXT-filer her. Dato og stilling hentes nå automatisk!")
+st.sidebar.markdown("Dra og slipp `.scatt`, `.csv` eller `.txt`-filer her. Dato, stilling og data hentes automatisk!")
 
+# Har fjernet 'type'-begrensningen slik at den godtar rå SCATT-filer
 opplastede_filer = st.sidebar.file_uploader(
     "Velg Filer", 
-    type=["csv", "txt"], 
     accept_multiple_files=True
 )
 
 if opplastede_filer:
     st.sidebar.info(f"📁 {len(opplastede_filer)} filer lagt i kø.")
     
-    # Fjernet den manuelle nedtrekksmenyen for stilling
     if st.sidebar.button("Skann og lagre filer", type="primary"):
         nye_rader = []
         for fil in opplastede_filer:
             resultat = behandle_scatt_fil(fil)
             
-            # Sjekker at den fant selve tallene
             if resultat and resultat['DA'] is not None:
                 fil_dato = finn_dato_fra_filnavn(fil.name)
-                
                 nye_rader.append({
                     'Dato': pd.to_datetime(fil_dato),
                     'Filnavn': fil.name,
-                    'Stilling': resultat['Stilling_Autodetect'], # Bruker autodetect
+                    'Stilling': resultat['Stilling_Autodetect'],
                     'DA': resultat['DA'],
                     's1': resultat['s1'],
                     's2': resultat['s2'],
@@ -143,7 +160,7 @@ if opplastede_filer:
                     '10a5': resultat['10a5']
                 })
             else:
-                st.sidebar.error(f"⚠️ Kunne ikke lese SCATT-data fra filen: {fil.name}")
+                st.sidebar.error(f"⚠️ Kunne ikke lese SCATT-data fra: {fil.name}")
         
         if nye_rader:
             nye_df = pd.DataFrame(nye_rader)
@@ -152,7 +169,6 @@ if opplastede_filer:
 
 st.sidebar.divider()
 
-# Filtrering for dashboardet
 st.sidebar.subheader("2. Filtrer Dashboard")
 alle_stillinger = ['Ligg', 'Kne', 'Stå luft', 'Stå 50m', 'Ligg luft (SH)', 'Ukjent']
 valgte_stillinger = st.sidebar.multiselect(
@@ -162,7 +178,7 @@ valgte_stillinger = st.sidebar.multiselect(
 )
 
 # ==========================================
-# 4. HOVEDVINDU (Dashboard & Visualisering)
+# 4. HOVEDVINDU (DASHBOARD)
 # ==========================================
 st.title("🎯 SCATT Analyse Dashboard")
 
@@ -174,10 +190,9 @@ else:
     filtrert_df = pd.DataFrame()
 
 if filtrert_df.empty:
-    st.info("👋 Velkommen! Eksporter SCATT-øktene dine som tekst/CSV og dra dem inn i menyen til venstre.")
+    st.info("👋 Velkommen! Dra og slipp de rå SCATT-filene dine i menyen til venstre.")
 else:
-    # --- DEL 1: PERSONLIGE REKORDER (PERSER) ---
-    st.header("🏆 Personlige Rekorder for valgte stillinger")
+    st.header("🏆 Personlige Rekorder")
     st.markdown("**LAV** verdi er best for DA, s1 og s2. **HØY** verdi er best for 10a0 og 10a5.")
     
     kol1, kol2, kol3, kol4, kol5 = st.columns(5)
@@ -195,8 +210,6 @@ else:
     kol5.metric("Beste 10a5", f"{beste_10a5:.1f}" if pd.notnull(beste_10a5) else "N/A", delta="Høyere er bedre", delta_color="normal")
     
     st.divider()
-    
-    # --- DEL 2: GRAFER (Utvikling over tid) ---
     st.header("📈 Utvikling over tid")
     
     graf_data = filtrert_df.copy()
@@ -204,29 +217,22 @@ else:
     graf_data = graf_data.set_index('Dato')
     
     g_kol1, g_kol2 = st.columns(2)
-    
     with g_kol1:
-        st.subheader("Balanse: DA Utvikling")
+        st.subheader("Balanse: DA")
         st.line_chart(graf_data['DA'])
-        
-        st.subheader("Stabilitet (1.0s): s1 Utvikling")
+        st.subheader("Stabilitet (1.0s): s1")
         st.line_chart(graf_data['s1'])
-        
-        st.subheader("Treffsikkerhet: 10a0 Utvikling")
+        st.subheader("Treffsikkerhet: 10a0")
         st.line_chart(graf_data['10a0'], color="#2ecc71") 
         
     with g_kol2:
         st.write("") 
-        
-        st.subheader("Stabilitet (0.2s): s2 Utvikling")
+        st.subheader("Stabilitet (0.2s): s2")
         st.line_chart(graf_data['s2'])
-        
-        st.subheader("Treffsikkerhet: 10a5 Utvikling")
+        st.subheader("Treffsikkerhet: 10a5")
         st.line_chart(graf_data['10a5'], color="#2ecc71") 
 
     st.divider()
-    
-    # --- DEL 3: HISTORIKK ---
     st.header("📋 Historikk")
     
     visnings_df = filtrert_df.copy()
