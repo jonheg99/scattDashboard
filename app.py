@@ -5,21 +5,25 @@ import re
 import tempfile
 import sqlite3
 import pypdf
+import io
 
 # ==========================================
 # 1. KONFIGURASJON AV SIDEN
 # ==========================================
 st.set_page_config(page_title="SCATT Analyse Dashboard", page_icon="🎯", layout="wide")
 
+# Database i minnet for sesjonen
 if 'treningsdata' not in st.session_state:
     st.session_state.treningsdata = pd.DataFrame(
         columns=['Dato', 'Filnavn', 'Stilling', 'DA', 's1', 's2', '10a0', '10a5']
     )
 
 # ==========================================
-# 2. HJELPEFUNKSJONER (PDF og Tekst)
+# 2. HJELPEFUNKSJONER (PDF- og Dato-detektiver)
 # ==========================================
+
 def finn_dato_fra_filnavn(filnavn):
+    """Prøver å finne dato i formatet DD-MM-YY eller DD-MM-YYYY i filnavnet."""
     match = re.search(r'(\d{2})[-.](\d{2})[-.](\d{2,4})', filnavn)
     if match:
         try:
@@ -27,136 +31,102 @@ def finn_dato_fra_filnavn(filnavn):
             aar = int(d3)
             if aar < 100: aar += 2000
             return datetime.date(aar, int(d2), int(d1))
-        except ValueError:
-            pass
+        except: pass
     return datetime.date.today()
 
 def finn_stilling_i_tekst(tekst):
-    tekst_lower = tekst.lower()
-    if any(ord in tekst_lower for ord in ['kneeling', 'kne', 'knestående']): return 'Kne'
-    if any(ord in tekst_lower for ord in ['standing', 'stå', 'stående']):
-        if '50m' in tekst_lower: return 'Stå 50m'
-        return 'Stå luft'
-    if any(ord in tekst_lower for ord in ['prone', 'ligg', 'liggende']):
-        if 'sh' in tekst_lower: return 'Ligg luft (SH)'
-        return 'Ligg'
+    """Analyserer teksten for å finne skytterstillingen."""
+    t = tekst.lower()
+    if any(x in t for x in ['kneeling', 'kne']): return 'Kne'
+    if any(x in t for x in ['standing', 'stå']): return 'Stå 50m' if '50m' in t else 'Stå luft'
+    if any(x in t for x in ['prone', 'ligg']): return 'Ligg luft (SH)' if 'sh' in t else 'Ligg'
     return 'Ukjent'
 
-def trekk_ut_data_fra_tekst(tekst, filnavn="Ukjent"):
-    """Søker gjennom utvunnet tekst (fra PDF) for å finne totalsnittet."""
-    funnet_stilling = finn_stilling_i_tekst(tekst)
-    linjer = tekst.strip().split('\n')
+def trekk_ut_scatt_verdier(tekst):
+    """
+    Spesialfunksjon som leter etter den siste raden i SCATT-tabellen.
+    Strukturen er: [Sum] [Poeng] [Tid] [6a0] [9a0] [10.0] [10.5] [10a0] [10a5] [s1] [s2] [DA]
+    """
+    # Vi leter etter en linje som starter med et tall (sum) og har mange tall/prosenttegn
+    # Eksempel fra din PDF: 385 402.6 11.1 0% 0% 66% 17% 99% 82% 40.2 44.2 2.0
+    pattern = r"(\d{2,3})\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+%)\s+(\d+%)\s+(\d+%)\s+(\d+%)\s+(\d+%)\s+(\d+%)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)"
     
-    header_rad_index = -1
-    overskrifter = []
-    
-    # Finn raden med overskrifter. Deler opp basert på mellomrom, tab, komma eller semikolon
-    for i, linje in enumerate(linjer):
-        kolonner = [k.strip().lower() for k in re.split(r'[;\t,]+|\s{2,}', linje) if k.strip()]
-        if any(x in kolonner for x in ['da', 'd.a', '10.0', '10a0', '10a.0']):
-            header_rad_index = i
-            overskrifter = kolonner
-            break
-            
-    if header_rad_index == -1: return None
-        
-    siste_gyldige_kolonner = []
-    for linje in reversed(linjer[header_rad_index + 1:]):
-        kolonner = [k.strip() for k in re.split(r'[;\t,]+|\s{2,}', linje) if k.strip()]
-        if len(kolonner) >= len(overskrifter) - 2:
-            siste_gyldige_kolonner = kolonner
-            break
-            
-    if not siste_gyldige_kolonner: return None
-
-    def hent_tall(mulige_navn):
-        for navn in mulige_navn:
-            for i, overskrift in enumerate(overskrifter):
-                if navn.lower() in overskrift and i < len(siste_gyldige_kolonner):
-                    verdi_tekst = siste_gyldige_kolonner[i].replace(',', '.')
-                    try: return float(verdi_tekst)
-                    except ValueError: pass
-        return None
-
-    return {
-        'Dato': pd.to_datetime(finn_dato_fra_filnavn(filnavn)),
-        'Filnavn': filnavn,
-        'Stilling': funnet_stilling,
-        'DA': hent_tall(['da', 'd.a']),
-        's1': hent_tall(['s1', 's.1']),
-        's2': hent_tall(['s2', 's.2']),
-        '10a0': hent_tall(['10a0', '10.0', '10a.0', '10.a0']),
-        '10a5': hent_tall(['10a5', '10.5', '10a.5', '10.a5'])
-    }
+    # Finn alle treff og ta det siste (som er totalsummen)
+    treff = re.findall(pattern, tekst)
+    if treff:
+        siste_rad = treff[-1]
+        return {
+            '10a0': float(siste_rad[7].replace('%', '')), # Index 7: 99%
+            '10a5': float(siste_rad[8].replace('%', '')), # Index 8: 82%
+            's1': float(siste_rad[9]),                     # Index 9: 40.2 (mm/s)
+            's2': float(siste_rad[10]),                    # Index 10: 44.2 (mm/s/250ms)
+            'DA': float(siste_rad[11])                     # Index 11: 2.0
+        }
+    return None
 
 def behandle_pdf(fil):
-    """Leser teksten ut av en PDF-fil."""
+    """Leser PDF og returnerer ferdigformaterte data."""
     try:
         pdf_leser = pypdf.PdfReader(fil)
         hel_tekst = ""
         for side in pdf_leser.pages:
             hel_tekst += side.extract_text() + "\n"
-        return trekk_ut_data_fra_tekst(hel_tekst, fil.name)
-    except Exception as e:
+        
+        verdier = trekk_ut_scatt_verdier(hel_tekst)
+        if verdier:
+            verdier.update({
+                'Dato': pd.to_datetime(finn_dato_fra_filnavn(fil.name)),
+                'Filnavn': fil.name,
+                'Stilling': finn_stilling_i_tekst(hel_tekst)
+            })
+            return verdier
+        return None
+    except:
         return None
 
 # ==========================================
-# 3. SIDEBAR (MENY & OPPLASTING)
+# 3. SIDEBAR (KONTROLLPANEL)
 # ==========================================
 st.sidebar.title("⚙️ Kontrollpanel")
 
 # --- SPOR 1: SCATT EXPERT DATABASE ---
 st.sidebar.subheader("1. SCATT Expert (Database)")
-st.sidebar.markdown("Last opp `storage.db` eller `scatt.db` filen din.")
-db_fil = st.sidebar.file_uploader("Velg Database-fil", type=["db", "sqlite", "dat"])
+st.sidebar.markdown("Last opp `storage.db` eller `.dat`-filen.")
+db_fil = st.sidebar.file_uploader("Database-fil", type=["db", "dat", "sqlite"])
 
 if db_fil:
-    st.sidebar.success("Database lastet opp!")
-    # Lagrer databasen midlertidig for å kunne lese den med sqlite3
     with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
         tmp.write(db_fil.getvalue())
         tmp_path = tmp.name
-    
     try:
         conn = sqlite3.connect(tmp_path)
-        # Henter ut alle tabellnavn i databasen (Røntgen-syn)
         tabeller = pd.read_sql_query("SELECT name FROM sqlite_master WHERE type='table';", conn)
-        
-        st.sidebar.markdown("### 🔍 Database-Røntgen")
-        st.sidebar.info("Vi ser disse tabellene i filen din:")
-        st.sidebar.dataframe(tabeller)
-        st.sidebar.warning("Send meg navnene på tabellene over, så låser jeg opp dataene dine!")
+        st.sidebar.info("Tabeller funnet i databasen din:")
+        st.sidebar.dataframe(tabeller, hide_index=True)
         conn.close()
     except Exception as e:
-        st.sidebar.error(f"Kunne ikke lese database: {e}")
+        st.sidebar.error(f"Feil: {e}")
 
 st.sidebar.divider()
 
-# --- SPOR 2: GAMLE PDF'er ---
+# --- SPOR 2: PDF ---
 st.sidebar.subheader("2. Gamle økter (PDF)")
-st.sidebar.markdown("Dra og slipp flere PDF-filer her. Alt skjer automatisk.")
-pdf_filer = st.sidebar.file_uploader("Velg PDF-filer", type=["pdf"], accept_multiple_files=True)
+st.sidebar.markdown("Dra og slipp alle PDF-filene dine her.")
+pdf_filer = st.sidebar.file_uploader("PDF-opplasting", type=["pdf"], accept_multiple_files=True)
 
 if pdf_filer:
-    if st.sidebar.button("Skann og lagre PDF-er", type="primary"):
+    if st.sidebar.button("Skann PDF-er", type="primary"):
         nye_rader = []
         for fil in pdf_filer:
             resultat = behandle_pdf(fil)
-            if resultat and resultat['DA'] is not None:
+            if resultat:
                 nye_rader.append(resultat)
             else:
-                st.sidebar.error(f"⚠️ Fant ikke SCATT-tall i: {fil.name}")
+                st.sidebar.error(f"Klarte ikke å tolke tabellen i: {fil.name}")
         
         if nye_rader:
-            nye_df = pd.DataFrame(nye_rader)
-            st.session_state.treningsdata = pd.concat([st.session_state.treningsdata, nye_df], ignore_index=True)
-            st.sidebar.success(f"Vellykket! La til {len(nye_rader)} økter fra PDF.")
-
-st.sidebar.divider()
-
-st.sidebar.subheader("3. Filtrer Dashboard")
-alle_stillinger = ['Ligg', 'Kne', 'Stå luft', 'Stå 50m', 'Ligg luft (SH)', 'Ukjent']
-valgte_stillinger = st.sidebar.multiselect("Vis data for følgende stillinger:", options=alle_stillinger, default=alle_stillinger)
+            st.session_state.treningsdata = pd.concat([st.session_state.treningsdata, pd.DataFrame(nye_rader)], ignore_index=True)
+            st.sidebar.success(f"Vellykket! La til {len(nye_rader)} økter.")
 
 # ==========================================
 # 4. HOVEDVINDU (DASHBOARD)
@@ -164,56 +134,42 @@ valgte_stillinger = st.sidebar.multiselect("Vis data for følgende stillinger:",
 st.title("🎯 SCATT Analyse Dashboard")
 
 df = st.session_state.treningsdata
-if not df.empty:
-    filtrert_df = df[df['Stilling'].isin(valgte_stillinger)].copy()
-    filtrert_df = filtrert_df.sort_values(by='Dato') 
-else:
-    filtrert_df = pd.DataFrame()
 
-if filtrert_df.empty:
-    st.info("👋 Velkommen! Last opp din SCATT-database eller dra inn PDF-er i menyen til venstre.")
+if df.empty:
+    st.info("👋 Velkommen! Last opp din Expert-database eller dra inn PDF-er i sidebaren til venstre.")
 else:
+    # --- FILTRERING ---
+    stillinger_i_data = df['Stilling'].unique()
+    valgte = st.multiselect("Filtrer stilling:", options=stillinger_i_data, default=stillinger_i_data)
+    f_df = df[df['Stilling'].isin(valgte)].sort_values('Dato')
+
+    # --- METRIKKER / PERSER ---
     st.header("🏆 Personlige Rekorder")
+    k1, k2, k3, k4, k5 = st.columns(5)
     
-    kol1, kol2, kol3, kol4, kol5 = st.columns(5)
-    beste_da = filtrert_df['DA'].min()
-    beste_s1 = filtrert_df['s1'].min()
-    beste_s2 = filtrert_df['s2'].min()
-    beste_10a0 = filtrert_df['10a0'].max()
-    beste_10a5 = filtrert_df['10a5'].max()
-    
-    kol1.metric("Beste DA", f"{beste_da:.1f}" if pd.notnull(beste_da) else "N/A", delta="Mindre er bedre", delta_color="inverse")
-    kol2.metric("Beste s1", f"{beste_s1:.1f}" if pd.notnull(beste_s1) else "N/A", delta="Mindre er bedre", delta_color="inverse")
-    kol3.metric("Beste s2", f"{beste_s2:.1f}" if pd.notnull(beste_s2) else "N/A", delta="Mindre er bedre", delta_color="inverse")
-    kol4.metric("Beste 10a0", f"{beste_10a0:.1f}" if pd.notnull(beste_10a0) else "N/A", delta="Høyere er bedre", delta_color="normal")
-    kol5.metric("Beste 10a5", f"{beste_10a5:.1f}" if pd.notnull(beste_10a5) else "N/A", delta="Høyere er bedre", delta_color="normal")
-    
-    st.divider()
-    st.header("📈 Utvikling over tid")
-    
-    graf_data = filtrert_df.copy()
-    graf_data['Dato'] = graf_data['Dato'].dt.strftime('%Y-%m-%d')
-    graf_data = graf_data.set_index('Dato')
-    
-    g_kol1, g_kol2 = st.columns(2)
-    with g_kol1:
-        st.subheader("Balanse: DA")
-        st.line_chart(graf_data['DA'])
-        st.subheader("Stabilitet (1.0s): s1")
-        st.line_chart(graf_data['s1'])
-        st.subheader("Treffsikkerhet: 10a0")
-        st.line_chart(graf_data['10a0'], color="#2ecc71") 
-        
-    with g_kol2:
-        st.write("") 
-        st.subheader("Stabilitet (0.2s): s2")
-        st.line_chart(graf_data['s2'])
-        st.subheader("Treffsikkerhet: 10a5")
-        st.line_chart(graf_data['10a5'], color="#2ecc71") 
+    # Lavest er best for DA, s1, s2
+    k1.metric("Beste DA", f"{f_df['DA'].min():.1f}")
+    k2.metric("Beste s1", f"{f_df['s1'].min():.1f}")
+    k3.metric("Beste s2", f"{f_df['s2'].min():.1f}")
+    # Høyest er best for 10a0, 10a5
+    k4.metric("Beste 10a0", f"{f_df['10a0'].max():.1f}%")
+    k5.metric("Beste 10a5", f"{f_df['10a5'].max():.1f}%")
 
     st.divider()
-    st.header("📋 Historikk")
-    
-    visnings_df = filtrert_df.copy()
-    visnings_df['Dato'] = visnings_df['Dato'].dt.strftime('%d.%m.%Y') 
-    st.dataframe(visnings_df, use_container_width=True, hide_index=True)
+
+    # --- VISUALISERING ---
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("DA Utvikling (Lavere = Bedre)")
+        st.line_chart(f_df.set_index('Dato')['DA'])
+        st.subheader("Stabilitet s1 (Lavere = Bedre)")
+        st.line_chart(f_df.set_index('Dato')['s1'])
+        
+    with c2:
+        st.subheader("Treffprosent 10a0 (Høyere = Bedre)")
+        st.line_chart(f_df.set_index('Dato')['10a0'], color="#2ecc71")
+        st.subheader("Treffprosent 10a5 (Høyere = Bedre)")
+        st.line_chart(f_df.set_index('Dato')['10a5'], color="#27ae60")
+
+    st.header("📋 Økthistorikk")
+    st.dataframe(f_df, use_container_width=True, hide_index=True)
