@@ -2,8 +2,9 @@ import streamlit as st
 import pandas as pd
 import datetime
 import re
-import olefile
-import io
+import tempfile
+import sqlite3
+import pypdf
 
 # ==========================================
 # 1. KONFIGURASJON AV SIDEN
@@ -16,24 +17,21 @@ if 'treningsdata' not in st.session_state:
     )
 
 # ==========================================
-# 2. HJELPEFUNKSJONER OG "LÅSESMED"
+# 2. HJELPEFUNKSJONER (PDF og Tekst)
 # ==========================================
 def finn_dato_fra_filnavn(filnavn):
-    """Finner dato automatisk fra filnavnet."""
     match = re.search(r'(\d{2})[-.](\d{2})[-.](\d{2,4})', filnavn)
     if match:
         try:
             d1, d2, d3 = match.groups()
             aar = int(d3)
-            if aar < 100: 
-                aar += 2000
+            if aar < 100: aar += 2000
             return datetime.date(aar, int(d2), int(d1))
         except ValueError:
             pass
     return datetime.date.today()
 
 def finn_stilling_i_tekst(tekst):
-    """Leter etter stilling inni filen."""
     tekst_lower = tekst.lower()
     if any(ord in tekst_lower for ord in ['kneeling', 'kne', 'knestående']): return 'Kne'
     if any(ord in tekst_lower for ord in ['standing', 'stå', 'stående']):
@@ -44,80 +42,46 @@ def finn_stilling_i_tekst(tekst):
         return 'Ligg'
     return 'Ukjent'
 
-def dirk_opp_scatt_fil(fil_bytes):
-    """
-    Dette er låsesmeden. Den sjekker om filen er en OLE-binærfil (.scatt),
-    og trekker ut teksten. Hvis ikke, leses den som vanlig tekst.
-    """
-    fil_io = io.BytesIO(fil_bytes)
-    
-    # Sjekk om dette er en proprietær SCATT binærfil (OLE)
-    if olefile.isOleFile(fil_io):
-        ole = olefile.OleFileIO(fil_io)
-        utvunnet_tekst = ""
-        # Gå gjennom alle "strømmene" inne i den lukkede filen
-        for stream in ole.listdir():
-            try:
-                data = ole.openstream(stream).read()
-                # Rens bort null-bytes som ofte gjemmer teksten i OLE-filer
-                renset_data = data.replace(b'\x00', b'').decode('utf-8', errors='ignore')
-                utvunnet_tekst += renset_data + "\n"
-            except Exception:
-                pass
-        return utvunnet_tekst
-    else:
-        # Hvis det er en vanlig CSV eller TXT
-        # Vi fjerner null-bytes her også for sikkerhets skyld
-        return fil_bytes.replace(b'\x00', b'').decode('utf-8', errors='ignore')
-
-def behandle_scatt_fil(fil):
-    """Mottar filen, bruker låsesmeden, og fisker ut resultatene."""
-    rådata_bytes = fil.getvalue()
-    
-    # Pakk ut teksten fra binærfilen
-    tekst = dirk_opp_scatt_fil(rådata_bytes)
+def trekk_ut_data_fra_tekst(tekst, filnavn="Ukjent"):
+    """Søker gjennom utvunnet tekst (fra PDF) for å finne totalsnittet."""
     funnet_stilling = finn_stilling_i_tekst(tekst)
-    
     linjer = tekst.strip().split('\n')
-    # Finn skilletegn
-    skilletegn = ';' if tekst[:2000].count(';') > tekst[:2000].count(',') else ','
     
     header_rad_index = -1
     overskrifter = []
     
+    # Finn raden med overskrifter. Deler opp basert på mellomrom, tab, komma eller semikolon
     for i, linje in enumerate(linjer):
-        kolonner = [k.strip().lower() for k in linje.split(skilletegn)]
+        kolonner = [k.strip().lower() for k in re.split(r'[;\t,]+|\s{2,}', linje) if k.strip()]
         if any(x in kolonner for x in ['da', 'd.a', '10.0', '10a0', '10a.0']):
             header_rad_index = i
             overskrifter = kolonner
             break
             
-    if header_rad_index == -1: 
-        return None
+    if header_rad_index == -1: return None
         
     siste_gyldige_kolonner = []
     for linje in reversed(linjer[header_rad_index + 1:]):
-        kolonner = [k.strip() for k in linje.split(skilletegn)]
+        kolonner = [k.strip() for k in re.split(r'[;\t,]+|\s{2,}', linje) if k.strip()]
         if len(kolonner) >= len(overskrifter) - 2:
             siste_gyldige_kolonner = kolonner
             break
             
-    if not siste_gyldige_kolonner: 
-        return None
+    if not siste_gyldige_kolonner: return None
 
     def hent_tall(mulige_navn):
         for navn in mulige_navn:
             for i, overskrift in enumerate(overskrifter):
                 if navn.lower() in overskrift and i < len(siste_gyldige_kolonner):
                     verdi_tekst = siste_gyldige_kolonner[i].replace(',', '.')
-                    try: 
-                        return float(verdi_tekst)
-                    except ValueError: 
-                        pass
+                    try: return float(verdi_tekst)
+                    except ValueError: pass
         return None
 
     return {
-        'Stilling_Autodetect': funnet_stilling,
+        'Dato': pd.to_datetime(finn_dato_fra_filnavn(filnavn)),
+        'Filnavn': filnavn,
+        'Stilling': funnet_stilling,
         'DA': hent_tall(['da', 'd.a']),
         's1': hent_tall(['s1', 's.1']),
         's2': hent_tall(['s2', 's.2']),
@@ -125,57 +89,74 @@ def behandle_scatt_fil(fil):
         '10a5': hent_tall(['10a5', '10.5', '10a.5', '10.a5'])
     }
 
+def behandle_pdf(fil):
+    """Leser teksten ut av en PDF-fil."""
+    try:
+        pdf_leser = pypdf.PdfReader(fil)
+        hel_tekst = ""
+        for side in pdf_leser.pages:
+            hel_tekst += side.extract_text() + "\n"
+        return trekk_ut_data_fra_tekst(hel_tekst, fil.name)
+    except Exception as e:
+        return None
+
 # ==========================================
-# 3. SIDEBAR (MENY)
+# 3. SIDEBAR (MENY & OPPLASTING)
 # ==========================================
 st.sidebar.title("⚙️ Kontrollpanel")
 
-st.sidebar.subheader("1. Lynrask Masseopplasting")
-st.sidebar.markdown("Dra og slipp `.scatt`, `.csv` eller `.txt`-filer her. Dato, stilling og data hentes automatisk!")
+# --- SPOR 1: SCATT EXPERT DATABASE ---
+st.sidebar.subheader("1. SCATT Expert (Database)")
+st.sidebar.markdown("Last opp `storage.db` eller `scatt.db` filen din.")
+db_fil = st.sidebar.file_uploader("Velg Database-fil", type=["db", "sqlite", "dat"])
 
-# Har fjernet 'type'-begrensningen slik at den godtar rå SCATT-filer
-opplastede_filer = st.sidebar.file_uploader(
-    "Velg Filer", 
-    accept_multiple_files=True
-)
-
-if opplastede_filer:
-    st.sidebar.info(f"📁 {len(opplastede_filer)} filer lagt i kø.")
+if db_fil:
+    st.sidebar.success("Database lastet opp!")
+    # Lagrer databasen midlertidig for å kunne lese den med sqlite3
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        tmp.write(db_fil.getvalue())
+        tmp_path = tmp.name
     
-    if st.sidebar.button("Skann og lagre filer", type="primary"):
+    try:
+        conn = sqlite3.connect(tmp_path)
+        # Henter ut alle tabellnavn i databasen (Røntgen-syn)
+        tabeller = pd.read_sql_query("SELECT name FROM sqlite_master WHERE type='table';", conn)
+        
+        st.sidebar.markdown("### 🔍 Database-Røntgen")
+        st.sidebar.info("Vi ser disse tabellene i filen din:")
+        st.sidebar.dataframe(tabeller)
+        st.sidebar.warning("Send meg navnene på tabellene over, så låser jeg opp dataene dine!")
+        conn.close()
+    except Exception as e:
+        st.sidebar.error(f"Kunne ikke lese database: {e}")
+
+st.sidebar.divider()
+
+# --- SPOR 2: GAMLE PDF'er ---
+st.sidebar.subheader("2. Gamle økter (PDF)")
+st.sidebar.markdown("Dra og slipp flere PDF-filer her. Alt skjer automatisk.")
+pdf_filer = st.sidebar.file_uploader("Velg PDF-filer", type=["pdf"], accept_multiple_files=True)
+
+if pdf_filer:
+    if st.sidebar.button("Skann og lagre PDF-er", type="primary"):
         nye_rader = []
-        for fil in opplastede_filer:
-            resultat = behandle_scatt_fil(fil)
-            
+        for fil in pdf_filer:
+            resultat = behandle_pdf(fil)
             if resultat and resultat['DA'] is not None:
-                fil_dato = finn_dato_fra_filnavn(fil.name)
-                nye_rader.append({
-                    'Dato': pd.to_datetime(fil_dato),
-                    'Filnavn': fil.name,
-                    'Stilling': resultat['Stilling_Autodetect'],
-                    'DA': resultat['DA'],
-                    's1': resultat['s1'],
-                    's2': resultat['s2'],
-                    '10a0': resultat['10a0'],
-                    '10a5': resultat['10a5']
-                })
+                nye_rader.append(resultat)
             else:
-                st.sidebar.error(f"⚠️ Kunne ikke lese SCATT-data fra: {fil.name}")
+                st.sidebar.error(f"⚠️ Fant ikke SCATT-tall i: {fil.name}")
         
         if nye_rader:
             nye_df = pd.DataFrame(nye_rader)
             st.session_state.treningsdata = pd.concat([st.session_state.treningsdata, nye_df], ignore_index=True)
-            st.sidebar.success(f"Vellykket! La til {len(nye_rader)} økter.")
+            st.sidebar.success(f"Vellykket! La til {len(nye_rader)} økter fra PDF.")
 
 st.sidebar.divider()
 
-st.sidebar.subheader("2. Filtrer Dashboard")
+st.sidebar.subheader("3. Filtrer Dashboard")
 alle_stillinger = ['Ligg', 'Kne', 'Stå luft', 'Stå 50m', 'Ligg luft (SH)', 'Ukjent']
-valgte_stillinger = st.sidebar.multiselect(
-    "Vis data for følgende stillinger:",
-    options=alle_stillinger,
-    default=alle_stillinger 
-)
+valgte_stillinger = st.sidebar.multiselect("Vis data for følgende stillinger:", options=alle_stillinger, default=alle_stillinger)
 
 # ==========================================
 # 4. HOVEDVINDU (DASHBOARD)
@@ -190,13 +171,11 @@ else:
     filtrert_df = pd.DataFrame()
 
 if filtrert_df.empty:
-    st.info("👋 Velkommen! Dra og slipp de rå SCATT-filene dine i menyen til venstre.")
+    st.info("👋 Velkommen! Last opp din SCATT-database eller dra inn PDF-er i menyen til venstre.")
 else:
     st.header("🏆 Personlige Rekorder")
-    st.markdown("**LAV** verdi er best for DA, s1 og s2. **HØY** verdi er best for 10a0 og 10a5.")
     
     kol1, kol2, kol3, kol4, kol5 = st.columns(5)
-    
     beste_da = filtrert_df['DA'].min()
     beste_s1 = filtrert_df['s1'].min()
     beste_s2 = filtrert_df['s2'].min()
