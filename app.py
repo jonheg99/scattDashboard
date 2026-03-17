@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import datetime
 import io
-import csv
 
 # ==========================================
 # 1. KONFIGURASJON AV SIDEN
@@ -38,20 +37,27 @@ def behandle_scatt_fil(fil):
     """
     Finner ut av skilletegnet (komma eller semikolon), leser filen, 
     og henter ut dataene fra den aller siste raden.
+    Er nå gjort ekstra robust for å takle rotete SCATT-filer.
     """
-    # Les innholdet i filen som tekst
+    # Les innholdet i filen som tekst, ignorer rare tegn
     innhold = fil.getvalue().decode('utf-8', errors='replace')
     
-    # Bruk csv.Sniffer for å automatisk oppdage om det er komma eller semikolon
-    try:
-        skilletegn = csv.Sniffer().sniff(innhold[:2048]).delimiter
-    except csv.Error:
-        # Fallback: Tell hva som forekommer oftest av ; og , i starten av filen
-        skilletegn = ';' if innhold[:500].count(';') > innhold[:500].count(',') else ','
+    # Enkel og sikker måte å finne skilletegn på
+    # Teller om det er flest semikolon eller komma i de første 1000 tegnene
+    skilletegn = ';' if innhold[:1000].count(';') > innhold[:1000].count(',') else ','
 
-    # Les dataene inn i en pandas DataFrame
-    df = pd.read_csv(io.StringIO(innhold), sep=skilletegn)
-    
+    try:
+        # NY LØSNING: on_bad_lines='skip' ignorerer rader som ikke passer i rutenettet
+        df = pd.read_csv(
+            io.StringIO(innhold), 
+            sep=skilletegn, 
+            engine='python', 
+            on_bad_lines='skip' 
+        )
+    except Exception as e:
+        # Hvis filen er helt uleselig, returnerer vi ingenting for å unngå at appen krasjer
+        return None
+        
     if df.empty:
         return None
         
@@ -75,9 +81,10 @@ def behandle_scatt_fil(fil):
 st.sidebar.title("⚙️ Kontrollpanel")
 
 st.sidebar.subheader("1. Last opp SCATT-filer")
+# Oppdatert her for å godta .scatt, .csv og .txt filer
 opplastede_filer = st.sidebar.file_uploader(
-    "Velg SCATT-filer", 
-    type=["csv", "txt", "scatt"], # Endret her for å tillate flere filtyper
+    "Velg Filer", 
+    type=["csv", "txt", "scatt"], 
     accept_multiple_files=True,
     help="Du kan laste opp filer fra både gammel og ny SCATT-versjon."
 )
@@ -88,7 +95,6 @@ if opplastede_filer:
         st.markdown("**Detaljer for opplastede filer:**")
         valg_lagring = {}
         
-        # Gå gjennom hver fil så brukeren kan velge dato og stilling
         for fil in opplastede_filer:
             st.markdown(f"📄 *{fil.name}*")
             dato = st.date_input(f"Dato", datetime.date.today(), key=f"dato_{fil.name}")
@@ -102,14 +108,13 @@ if opplastede_filer:
             
         lagre_knapp = st.form_submit_button("Lagre alle til dashboard")
         
-        # Hvis brukeren trykker lagre, prosesserer vi filene
         if lagre_knapp:
             nye_rader = []
             for filnavn, data in valg_lagring.items():
                 resultat = behandle_scatt_fil(data['fil'])
                 if resultat:
                     ny_rad = {
-                        'Dato': pd.to_datetime(data['dato']), # Gjør om til ekte dato-format
+                        'Dato': pd.to_datetime(data['dato']),
                         'Filnavn': filnavn,
                         'Stilling': data['stilling'],
                         'DA': resultat['DA'],
@@ -119,11 +124,11 @@ if opplastede_filer:
                         '10a5': resultat['10a5']
                     }
                     nye_rader.append(ny_rad)
+                else:
+                    st.sidebar.error(f"Klarte ikke å lese data fra {filnavn}. Filen kan være tom eller ha et ukjent format.")
             
-            # Legg de nye dataene inn i hoveddatabasen
             if nye_rader:
                 nye_df = pd.DataFrame(nye_rader)
-                # Slå sammen eksisterende data med nye data og slett tomme rader
                 st.session_state.treningsdata = pd.concat([st.session_state.treningsdata, nye_df], ignore_index=True)
                 st.sidebar.success(f"Vellykket! {len(nye_rader)} fil(er) lagt til.")
 
@@ -135,7 +140,7 @@ alle_stillinger = ['Ligg', 'Kne', 'Stå luft', 'Stå 50m', 'Ligg luft (SH)']
 valgte_stillinger = st.sidebar.multiselect(
     "Vis data for følgende stillinger:",
     options=alle_stillinger,
-    default=alle_stillinger # Alle er valgt som standard
+    default=alle_stillinger 
 )
 
 # ==========================================
@@ -147,7 +152,6 @@ st.title("🎯 SCATT Analyse Dashboard")
 df = st.session_state.treningsdata
 if not df.empty:
     filtrert_df = df[df['Stilling'].isin(valgte_stillinger)].copy()
-    # Sorter etter dato for at grafer skal tegnes riktig
     filtrert_df = filtrert_df.sort_values(by='Dato') 
 else:
     filtrert_df = pd.DataFrame()
@@ -162,14 +166,12 @@ else:
     
     kol1, kol2, kol3, kol4, kol5 = st.columns(5)
     
-    # Beregn rekorder (Ignorerer tomme verdier)
     beste_da = filtrert_df['DA'].min()
     beste_s1 = filtrert_df['s1'].min()
     beste_s2 = filtrert_df['s2'].min()
     beste_10a0 = filtrert_df['10a0'].max()
     beste_10a5 = filtrert_df['10a5'].max()
     
-    # Vis grafikk i kolonnene
     kol1.metric("Beste DA", f"{beste_da:.1f}" if pd.notnull(beste_da) else "N/A", delta="Mindre er bedre", delta_color="inverse")
     kol2.metric("Beste s1", f"{beste_s1:.1f}" if pd.notnull(beste_s1) else "N/A", delta="Mindre er bedre", delta_color="inverse")
     kol3.metric("Beste s2", f"{beste_s2:.1f}" if pd.notnull(beste_s2) else "N/A", delta="Mindre er bedre", delta_color="inverse")
@@ -181,8 +183,6 @@ else:
     # --- DEL 2: GRAFER (Utvikling over tid) ---
     st.header("📈 Utvikling over tid")
     
-    # Gjør klar dataen for Streamlit sine line_charts (krever at X-aksen er indexen)
-    # Vi gjør Dato-kolonnen om til en ren tekststreng for penere visning på grafens X-akse
     graf_data = filtrert_df.copy()
     graf_data['Dato'] = graf_data['Dato'].dt.strftime('%Y-%m-%d')
     graf_data = graf_data.set_index('Dato')
@@ -197,17 +197,16 @@ else:
         st.line_chart(graf_data['s1'])
         
         st.subheader("Treffsikkerhet: 10a0 Utvikling")
-        st.line_chart(graf_data['10a0'], color="#2ecc71") # Grønn farge for poeng
+        st.line_chart(graf_data['10a0'], color="#2ecc71") 
         
     with g_kol2:
-        # Legger inn en tom boks (placeholder) for å jevne ut høyden i kolonnene
         st.write("") 
         
         st.subheader("Stabilitet (0.2s): s2 Utvikling")
         st.line_chart(graf_data['s2'])
         
         st.subheader("Treffsikkerhet: 10a5 Utvikling")
-        st.line_chart(graf_data['10a5'], color="#2ecc71") # Grønn farge for poeng
+        st.line_chart(graf_data['10a5'], color="#2ecc71") 
 
     st.divider()
     
@@ -215,7 +214,6 @@ else:
     st.header("📋 Historikk")
     st.markdown("Tabellen viser alle lagrede økter for de valgte stillingene.")
     
-    # Viser en interaktiv og pen dataframe
     visnings_df = filtrert_df.copy()
-    visnings_df['Dato'] = visnings_df['Dato'].dt.strftime('%d.%m.%Y') # Formaterer datoen pent til norsk standard
+    visnings_df['Dato'] = visnings_df['Dato'].dt.strftime('%d.%m.%Y') 
     st.dataframe(visnings_df, use_container_width=True, hide_index=True)
